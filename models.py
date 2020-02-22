@@ -63,9 +63,10 @@ class Discriminator_V(nn.Module):
             nn.LeakyReLU(0.2, inplace=True),
             # state size. (ndf*8) x T/16  x 6 x 6
             Flatten(),
-            nn.Linear(int((ndf*8)*(T/16)*6*6), 1),
+            nn.Linear((ndf*8)*(T//16)*6*6, 1),
             nn.Sigmoid()
         )
+
 
     def forward(self, input):
         if isinstance(input.data, torch.cuda.FloatTensor) and self.ngpu > 1:
@@ -75,40 +76,167 @@ class Discriminator_V(nn.Module):
 
         return output.view(-1, 1).squeeze(1)
 
+class Inconv(nn.Module):
+    def __init__(self, in_ch, out_ch, use_bias = False):
+        super(Inconv, self).__init__()
+        self.inconv = nn.Sequential(
+            #nn.ReflectionPad2d(3),
+            nn.Conv2d(in_ch, out_ch, kernel_size=4, stride=2, padding=1, bias=use_bias),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(True)
+        )
+
+    def forward(self, x):
+        x = self.inconv(x)
+        return x
+
+class Outconv(nn.Module):
+    def __init__(self, in_ch, out_ch):
+        super(Outconv, self).__init__()
+        self.outconv = nn.Sequential(
+            #nn.ReflectionPad2d(3),
+            nn.Conv2d(in_ch, out_ch, kernel_size=6, padding=0),
+            nn.Tanh()
+        )
+
+    def forward(self, x):
+        x = self.outconv(x)
+        return x
+
+class OutconvTrans(nn.Module):
+    def __init__(self, in_ch, out_ch):
+        super(OutconvTrans, self).__init__()
+        self.outconv = nn.Sequential(
+            #nn.ReflectionPad2d(3),
+            nn.ConvTranspose2d(in_ch, out_ch, kernel_size=6, padding=0),
+            nn.Tanh()
+        )
+
+    def forward(self, x):
+        x = self.outconv(x)
+        return x
+
+class G_down(nn.Module):
+    def __init__(self, in_ch, out_ch, norm_layer = nn.BatchNorm2d, use_bias = False):
+        super(G_down, self).__init__()
+        self.down = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, kernel_size=4,
+                      stride=2, padding=1, bias=use_bias),
+            norm_layer(out_ch),
+            nn.ReLU(True)
+        )
+
+    def forward(self, x):
+        x = self.down(x)
+        return x
+
+class G_up(nn.Module):
+    def __init__(self, in_ch, out_ch, norm_layer = nn.BatchNorm2d, use_bias = False):
+        super(G_up, self).__init__()
+        self.up = nn.Sequential(
+            nn.ConvTranspose2d(in_ch, out_ch,
+                               kernel_size=4, stride=2,
+                               padding=1,
+                               bias=use_bias),
+            norm_layer(out_ch),
+            nn.ReLU(True)
+        )
+
+    def forward(self, x):
+        x = self.up(x)
+        return x
+
+class G_encode(nn.Module):
+    def __init__(self, nz = 60, nef = 64, norm_layer = nn.BatchNorm2d, use_bias = False):
+        super(G_encode, self).__init__()
+        self.inc = nn.Sequential(nn.Conv2d(nz, nef, kernel_size=1, padding=0,
+                      bias=use_bias),
+                    norm_layer(nef),
+                    nn.ReLU(True))
+        down = []
+        n_downsampling = 3
+        mult = 0
+        for i in range(n_downsampling):
+            mult = 2**i
+            down += [nn.Conv2d(nef * mult, nef * mult * 2, kernel_size=1,
+                      stride=2, padding=0, bias=use_bias),
+                     norm_layer(nef * mult * 2),
+                     nn.ReLU(True)]
+        self.down = nn.Sequential(*down)
+        mult *= 2
+        self.outc = nn.Sequential(nn.Conv2d(nef * mult, nef * mult * 2, kernel_size=1, padding=0,
+                      bias=use_bias),
+                    norm_layer(nef * mult * 2),
+                    nn.ReLU(True))
+    def forward(self,x):
+        # print('G_encode Input =', x.size())
+        out = self.outc(self.down(self.inc(x)))
+        # print('G_encode Output =', out.size())
+        return out
 
 # see: _netG in https://github.com/pytorch/examples/blob/master/dcgan/main.py
 class Generator_I(nn.Module):
     def __init__(self, nc=3, ngf=64, nz=60, ngpu=1):
         super(Generator_I, self).__init__()
         self.ngpu = ngpu
-        self.main = nn.Sequential(
-            # input is Z, going into a convolution
-            nn.ConvTranspose2d(     nz, ngf * 8, 6, 1, 0, bias=False),
-            nn.BatchNorm2d(ngf * 8),
-            nn.ReLU(True),
-            # state size. (ngf*8) x 6 x 6
-            nn.ConvTranspose2d(ngf * 8, ngf * 4, 4, 2, 1, bias=False),
-            nn.BatchNorm2d(ngf * 4),
-            nn.ReLU(True),
-            # state size. (ngf*4) x 12 x 12
-            nn.ConvTranspose2d(ngf * 4, ngf * 2, 4, 2, 1, bias=False),
-            nn.BatchNorm2d(ngf * 2),
-            nn.ReLU(True),
-            # state size. (ngf*2) x 24 x 24
-            nn.ConvTranspose2d(ngf * 2,     ngf, 4, 2, 1, bias=False),
-            nn.BatchNorm2d(ngf),
-            nn.ReLU(True),
-            # state size. (ngf) x 48 x 48
-            nn.ConvTranspose2d(    ngf,      nc, 4, 2, 1, bias=False),
-            nn.Tanh()
-            # state size. (nc) x 96 x 96
-        )
+        self.input_nc = nc*2 # two frames
+        self.output_nc = nc
+        self.ngf = ngf
+        self.nz = nz
 
-    def forward(self, input):
-        if isinstance(input.data, torch.cuda.FloatTensor) and self.ngpu > 1:
-            output = nn.parallel.data_parallel(self.main, input, range(self.ngpu))
-        else:
-            output = self.main(input)
+        # Downsampling
+        self.inc = Inconv(self.input_nc, ngf)
+        self.encode = G_encode(nz, ngf)
+        down = []
+        n_downsampling = 3
+        mult = 0
+        for i in range(n_downsampling):
+            mult = 2**i
+            down += [G_down(ngf * mult, ngf * mult * 2)]
+        self.down = nn.Sequential(*down)
+
+        mult *= 2
+        self.outc = Outconv(mult * ngf, mult * ngf * 2) # [batch_size 1024 1 1]
+
+        # Upsampling
+        self.resnet = OutconvTrans(mult * ngf * 2, mult * ngf)
+        n_upsampling = 3
+        up = []
+        for i in range(n_upsampling):
+            mult = 2**(n_upsampling - i)
+            up += [G_up(ngf * mult, ngf * mult // 2)]
+        self.up = nn.Sequential(*up)
+
+        self.out = nn.Sequential(nn.ConvTranspose2d(ngf, self.output_nc, kernel_size=4, stride=2, padding=1,
+                      bias=False),
+                    nn.Tanh()) # [batch_size, 3 96 96]
+
+
+    def forward(self, x, z):
+        size = x.size()
+        # print ('size is',size)
+
+        self.bs, self.nf, self.h, self.w = size[0], size[1], size[3], size[4]
+        # print ('The shape of x is:', x.shape)
+        # print ('The shape of z is:', z.shape)
+
+        input_img = x.contiguous().view(self.bs, -1, self.h, self.w)
+        input_z = z.contiguous().view(self.bs, -1, 1, 1)
+        # print ('The shape of input_img is:', input_img.shape)
+        # print ('The shape of input_z is:', input_z.shape)
+
+        down_raw = self.outc(self.down(self.inc(input_img)))
+        # print ('The shape of down_raw is:', down_raw.shape)
+        down_z = self.encode(input_z)
+        # print ('The shape of down_z is:', down_z.shape)
+        down_img = down_raw + down_z
+        # print ('The shape of down_img is:', down_img.shape)
+
+        output = self.up(self.resnet(down_img))
+        # print ('The shape of output is:', output.shape)
+        output = self.out(output)
+        # print ('The shape of output is:', output.shape)
+
         return output
 
 
